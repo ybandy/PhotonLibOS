@@ -1,5 +1,6 @@
 /*
 Copyright 2022 The Photon Authors
+Copyright 2024 Kioxia Corporation
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -72,6 +73,11 @@ public:
         }
         delete m_ring;
         m_ring = nullptr;
+        if (m_read_ring != nullptr) {
+            io_uring_queue_exit(m_read_ring);
+        }
+        delete m_read_ring;
+        m_read_ring = nullptr;
         return 0;
     }
 
@@ -159,7 +165,75 @@ public:
                 LOG_ERRNO_RETURN(0, -1, "iouring: failed to register cascading event fd");
             }
         }
+
+        m_read_ring = new io_uring{};
+        io_uring_params read_params{};
+        read_params.flags = IORING_SETUP_IOPOLL;
+        ret = io_uring_queue_init_params(1024, m_read_ring, &read_params);
+        if (ret != 0) {
+            delete m_read_ring;
+            m_read_ring = nullptr;
+            LOG_ERROR_RETURN(0, -1, "iouring: failed to init read queue: ", ERRNO(-ret));
+        }
+
         return 0;
+    }
+
+    int32_t iouring_pread_iopoll(int fd, void* buf, size_t size, off_t offset, uint32_t ring_flags) {
+        io_data data = {
+            .fd = fd,
+            .buf = buf,
+            .size = size,
+            .offset = offset,
+        };
+
+        io_uring_sqe* sqe = io_uring_get_sqe(m_read_ring);
+        if (sqe == nullptr) {
+            LOG_ERROR_RETURN(EBUSY, -1, "iouring: read submission queue is full");
+            return -1;
+        }
+        io_uring_prep_read(sqe, data.fd, data.buf, data.size, data.offset);
+        io_uring_sqe_set_data(sqe, &data);
+        io_uring_submit(m_read_ring);
+
+        do {
+            io_uring_cqe* cqe;
+            int ret = io_uring_peek_cqe(m_read_ring, &cqe);
+            if (ret == -EAGAIN) {
+                photon::record_checkpoint(PHOTON_YIELD_IO_BEGIN);
+                photon::thread_yield();
+                photon::record_checkpoint(PHOTON_YIELD_IO_END);
+            } else if (ret < 0) {
+                LOG_ERROR_RETURN(-ret, -1, "io_uring_peek_cqe returns unexpected error");
+                return ret;
+            } else {
+                io_data* data_ = static_cast<io_data*>(io_uring_cqe_get_data(cqe));
+                if (cqe->res < 0) {
+                    LOG_ERROR_RETURN(-(cqe->res), -1, "read returns error");
+                    data_->error = cqe->res;
+                    io_uring_cqe_seen(m_read_ring, cqe);
+                } else {
+                    assert(data_->size >= cqe->res);
+                    data_->buf = static_cast<char *>(data_->buf) + cqe->res;
+                    data_->size -= cqe->res;
+                    data_->offset += cqe->res;
+                    /* Short read/write */
+                    if (data_->size > 0) {
+                        sqe = io_uring_get_sqe(m_read_ring);
+                        assert(sqe);
+
+                        io_uring_prep_read(sqe, data_->fd, data_->buf, data_->size, data_->offset);
+                        io_uring_sqe_set_data(sqe, data_);
+                        io_uring_submit(m_read_ring);
+                        io_uring_cqe_seen(m_read_ring, cqe);
+                    } else {
+                        io_uring_cqe_seen(m_read_ring, cqe);
+                    }
+                }
+            }
+        } while (!data.error && (data.size == size));
+
+        return data.error ? -1 : size - data.size;
     }
 
     /**
@@ -173,11 +247,26 @@ public:
      */
     template<typename Prep, typename... Args>
     int32_t async_io(Prep prep, Timeout timeout, uint32_t ring_flags, Args... args) {
+        if (prep == (Prep)&io_uring_prep_read) {
+            photon::record_checkpoint(IOURING_READ_BEGIN);
+        } else if (prep == (Prep)&io_uring_prep_write) {
+            photon::record_checkpoint(IOURING_WRITE_BEGIN);
+        } else {
+            photon::record_checkpoint(IOURING_IO_BEGIN);
+        }
         auto* sqe = _get_sqe();
         if (sqe == nullptr)
             return -1;
         prep(sqe, args...);
-        return _async_io(sqe, timeout, ring_flags);
+        auto ret = _async_io(sqe, timeout, ring_flags);
+        if (prep == (Prep)&io_uring_prep_read) {
+            photon::record_checkpoint(IOURING_READ_END);
+        } else if (prep == (Prep)&io_uring_prep_write) {
+            photon::record_checkpoint(IOURING_WRITE_END);
+        } else {
+            photon::record_checkpoint(IOURING_IO_END);
+        }
+        return ret;
     }
 
     int32_t _async_io(io_uring_sqe* sqe, Timeout timeout, uint32_t ring_flags) {
@@ -455,6 +544,14 @@ private:
         }
     };
 
+    struct io_data {
+        int fd;
+        void *buf;
+        size_t size;
+        off_t offset;
+        int error;
+    };
+
     io_uring_sqe* _get_sqe() {
         io_uring_sqe* sqe = io_uring_get_sqe(m_ring);
         if (sqe == nullptr) {
@@ -545,6 +642,7 @@ private:
     static const int REGISTER_FILES_MAX_NUM = 10000;
     bool m_master;
     io_uring* m_ring = nullptr;
+    io_uring* m_read_ring = nullptr;
     int m_eventfd = -1;
     std::unordered_map<fdInterest, eventCtx, fdInterestHasher> m_event_contexts;
     static int m_register_files_flag;
@@ -563,6 +661,12 @@ template<typename...Ts>
 inline size_t do_async_io(Ts...xs) {
     auto mee = (iouringEngine*) get_vcpu()->master_event_engine;
     return mee->async_io(xs...);
+}
+
+ssize_t iouring_pread_iopoll(int fd, void* buf, size_t count, off_t offset, uint64_t flags, Timeout timeout) {
+    uint32_t ring_flags = flags >> 32;
+    auto mee = (iouringEngine*) get_vcpu()->master_event_engine;
+    return mee->iouring_pread_iopoll(fd, buf, count, offset, ring_flags);
 }
 
 ssize_t iouring_pread(int fd, void* buf, size_t count, off_t offset, uint64_t flags, Timeout timeout) {

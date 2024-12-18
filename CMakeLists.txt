@@ -175,26 +175,26 @@ endif ()
 file(GLOB PHOTON_SRC RELATIVE "${PROJECT_SOURCE_DIR}"
         photon.cpp
         common/*.cpp
-        common/checksum/*.cpp
+        #common/checksum/*.cpp
         common/executor/*.cpp
         common/memory-stream/*.cpp
         fs/aligned-file.cpp
         fs/async_filesystem.cpp
         fs/exportfs.cpp
         fs/filecopy.cpp
-        fs/localfs.cpp
+        #fs/localfs.cpp
         fs/path.cpp
         fs/subfs.cpp
         fs/throttled-file.cpp
         fs/virtual-file.cpp
         fs/xfile.cpp
-        fs/httpfs/*.cpp
+        #fs/httpfs/*.cpp
         io/signal.cpp
         io/reset_handle.cpp
         net/*.cpp
-        net/http/*.cpp
+        #net/http/*.cpp
         net/security-context/tls-stream.cpp
-        rpc/*.cpp
+        #rpc/*.cpp
         thread/*.cpp
         )
 if (APPLE)

@@ -1,5 +1,6 @@
 /*
 Copyright 2022 The Photon Authors
+Copyright 2024 Kioxia Corporation
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -495,6 +496,43 @@ namespace photon
     // helps allocating when using hybrid C++20 style coroutine
     void* stackful_malloc(size_t size);
     void stackful_free(void* ptr);
+
+    enum Checkpoint {
+        PREFETCH_FOR_DATA_BLOCK_ITER_SEEK_BEGIN = 0,
+        PREFETCH_FOR_DATA_BLOCK_ITER_SEEK_END,
+        PREFETCH_FOR_DATA_BLOCK_ITER_NEXT_BEGIN,
+        PREFETCH_FOR_DATA_BLOCK_ITER_NEXT_END,
+        PREFETCH_FOR_BLOCK_ITER_BINARY_SEEK_BEGIN,
+        PREFETCH_FOR_BLOCK_ITER_BINARY_SEEK_END,
+        PREFETCH_FOR_PUT_DATA_BLOCK_BEGIN,
+        PREFETCH_FOR_PUT_DATA_BLOCK_END,
+        PREFETCH_FOR_CACHED_DATA_BLOCK_BEGIN,
+        PREFETCH_FOR_CACHED_DATA_BLOCK_END,
+        PHOTON_YIELD_BEGIN,
+        PHOTON_YIELD_END,
+        PHOTON_YIELD_IO_BEGIN,
+        PHOTON_YIELD_IO_END,
+        IOURING_READ_BEGIN,
+        IOURING_READ_END,
+        IOURING_WRITE_BEGIN,
+        IOURING_WRITE_END,
+        IOURING_IO_BEGIN,
+        IOURING_IO_END,
+        GET_BEGIN,
+        GET_END,
+        NUM_CHECKPOINTS,
+    };
+
+    extern __thread struct CheckpointTrace *trace;
+    void checkpoint_trace_dump(FILE *stream);
+    void checkpoint_trace_reset(void);
+//#define PHOTON_ENABLE_CHECKPOINT
+#ifdef PHOTON_ENABLE_CHECKPOINT
+    void record_checkpoint(enum Checkpoint checkpoint);
+#else
+    static inline void record_checkpoint(enum Checkpoint checkpoint) {
+    }
+#endif
 };
 
 /*

@@ -1,5 +1,6 @@
 /*
 Copyright 2022 The Photon Authors
+Copyright 2024 Kioxia Corporation
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,6 +30,8 @@ namespace photon {
 static const uint64_t IouringFixedFileFlag = 1UL << 32;
 
 ssize_t iouring_pread(int fd, void* buf, size_t count, off_t offset, uint64_t flags = 0, Timeout timeout = {});
+
+ssize_t iouring_pread_iopoll(int fd, void* buf, size_t count, off_t offset, uint64_t flags = 0, Timeout timeout = {});
 
 ssize_t iouring_pwrite(int fd, const void* buf, size_t count, off_t offset, uint64_t flags = 0, Timeout timeout = {});
 

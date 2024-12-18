@@ -1,5 +1,6 @@
 /*
 Copyright 2022 The Photon Authors
+Copyright 2024 Kioxia Corporation
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,6 +32,8 @@ limitations under the License.
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
+#include <deque>
 
 #ifdef _WIN64
 #include <processthreadsapi.h>
@@ -1168,17 +1171,21 @@ R"(
 
     int thread_yield()
     {
+        record_checkpoint(PHOTON_YIELD_BEGIN);
         RunQ rq;
         if_update_now();
         rq.current->error_number = 0;
         auto sw = AtomicRunQ(rq).goto_next();
         switch_context(sw.from, sw.to);
+        record_checkpoint(PHOTON_YIELD_END);
         return rq.current->error_number;
     }
 
     inline void thread_yield_fast() {
+        record_checkpoint(PHOTON_YIELD_BEGIN);
         auto sw = AtomicRunQ().goto_next();
         switch_context(sw.from, sw.to);
+        record_checkpoint(PHOTON_YIELD_END);
     }
 
     int thread_yield_to(thread* th) {
@@ -1199,10 +1206,12 @@ R"(
             LOG_ERROR_RETURN(EINVAL, -1, "target thread ` must be READY!", th);
         }
 
+        record_checkpoint(PHOTON_YIELD_BEGIN);
         auto sw = AtomicRunQ(rq).try_goto(th);
         if_update_now();
         rq.current->error_number = 0;
         switch_context(sw.from, sw.to);
+        record_checkpoint(PHOTON_YIELD_END);
         return rq.current->error_number;
     }
 
@@ -1235,9 +1244,11 @@ R"(
             return yield_as_sleep();
         }
 
+        record_checkpoint(PHOTON_YIELD_BEGIN);
         auto r = prepare_usleep(timeout, waitq);
         switch_context(r.from, r.to);
         assert(r.from->waitq == nullptr);
+        record_checkpoint(PHOTON_YIELD_END);
         return r.from->set_error_number();
     }
 
@@ -1245,18 +1256,22 @@ R"(
     static int thread_usleep_defer(Timeout timeout,
         thread_list* waitq, defer_func defer, void* defer_arg)
     {
+        record_checkpoint(PHOTON_YIELD_BEGIN);
         auto r = prepare_usleep(timeout, waitq);
         switch_context_defer(r.from, r.to, defer, defer_arg);
         assert(r.from->waitq == nullptr);
+        record_checkpoint(PHOTON_YIELD_END);
         return r.from->set_error_number();
     }
 
     __attribute__((noinline))
     static int do_thread_usleep_defer(Timeout timeout,
             defer_func defer, void* defer_arg, RunQ rq) {
+        record_checkpoint(PHOTON_YIELD_BEGIN);
         auto r = prepare_usleep(timeout, nullptr, rq);
         switch_context_defer(r.from, r.to, defer, defer_arg);
         assert(r.from->waitq == nullptr);
+        record_checkpoint(PHOTON_YIELD_END);
         return r.from->set_error_number();
     }
     static int do_shutdown_usleep_defer(Timeout timeout,
@@ -1285,9 +1300,11 @@ R"(
 
     __attribute__((noinline))
     static int do_thread_usleep(Timeout timeout, RunQ rq) {
+        record_checkpoint(PHOTON_YIELD_BEGIN);
         auto r = prepare_usleep(timeout, nullptr, rq);
         switch_context(r.from, r.to);
         assert(r.from->waitq == nullptr);
+        record_checkpoint(PHOTON_YIELD_END);
         return r.from->set_error_number();
     }
     static int do_shutdown_usleep(Timeout timeout, RunQ rq) {
@@ -1362,8 +1379,10 @@ R"(
         if (!th || th->vcpu != CURRENT->vcpu)
             LOG_ERROR_RETURN(EINVAL, -1, "target thread ` must be run on CURRENT vCPU", th);
         if (th->state == RUNNING) {
+            record_checkpoint(PHOTON_YIELD_BEGIN);
             auto next = AtomicRunQ().goto_next().to;
             switch_context_defer(th, next, do_stack_pages_gc, th);
+            record_checkpoint(PHOTON_YIELD_END);
         } else {
             do_stack_pages_gc(th);
         }
@@ -1840,10 +1859,12 @@ R"(
         do_thread_migrate(m->th, m->v);
     }
     static int defer_migrate_current(vcpu_base* v) {
+        record_checkpoint(PHOTON_YIELD_BEGIN);
         auto sw = AtomicRunQ().goto_next();
         migrate_args defer_arg{sw.from, v};
         switch_context_defer(sw.from, sw.to,
             &do_defer_migrate, &defer_arg);
+        record_checkpoint(PHOTON_YIELD_END);
         return 0;
     }
     int thread_migrate(thread* th, vcpu_base* v) {
@@ -1938,4 +1959,143 @@ R"(
         photon_thread_alloc = _photon_thread_alloc;
         photon_thread_dealloc = _photon_thread_dealloc;
     }
+
+
+
+    static const char* checkpoint_name[NUM_CHECKPOINTS] = {
+        [PREFETCH_FOR_DATA_BLOCK_ITER_SEEK_BEGIN] = "PREFETCH_FOR_DATA_BLOCK_ITER_SEEK",
+        [PREFETCH_FOR_DATA_BLOCK_ITER_SEEK_END] = "PREFETCH_FOR_DATA_BLOCK_ITER_SEEK",
+        [PREFETCH_FOR_DATA_BLOCK_ITER_NEXT_BEGIN] = "PREFETCH_FOR_DATA_BLOCK_ITER_NEXT",
+        [PREFETCH_FOR_DATA_BLOCK_ITER_NEXT_END] = "PREFETCH_FOR_DATA_BLOCK_ITER_NEXT",
+        [PREFETCH_FOR_BLOCK_ITER_BINARY_SEEK_BEGIN] = "PREFETCH_FOR_BLOCK_ITER_BINARY_SEEK",
+        [PREFETCH_FOR_BLOCK_ITER_BINARY_SEEK_END] = "PREFETCH_FOR_BLOCK_ITER_BINARY_SEEK",
+        [PREFETCH_FOR_PUT_DATA_BLOCK_BEGIN] = "PREFETCH_FOR_PUT_DATA_BLOCK",
+        [PREFETCH_FOR_PUT_DATA_BLOCK_END] = "PREFETCH_FOR_PUT_DATA_BLOCK",
+        [PREFETCH_FOR_CACHED_DATA_BLOCK_BEGIN] = "PREFETCH_FOR_CACHED_DATA_BLOCK",
+        [PREFETCH_FOR_CACHED_DATA_BLOCK_END] = "PREFETCH_FOR_CACHED_DATA_BLOCK",
+        [PHOTON_YIELD_BEGIN] = "PHOTON_YIELD",
+        [PHOTON_YIELD_END] = "PHOTON_YIELD",
+        [PHOTON_YIELD_IO_BEGIN] = "PHOTON_YIELD_IO",
+        [PHOTON_YIELD_IO_END] = "PHOTON_YIELD_IO",
+        [IOURING_READ_BEGIN] = "IOURING_READ",
+        [IOURING_READ_END] = "IOURING_READ",
+        [IOURING_WRITE_BEGIN] = "IOURING_WRITE",
+        [IOURING_WRITE_END] = "IOURING_WRITE",
+        [IOURING_IO_BEGIN] = "IOURING_IO",
+        [IOURING_IO_END] = "IOURING_IO",
+        [GET_BEGIN] = "GET",
+        [GET_END] = "GET",
+    };
+
+    struct CheckpointTraceEntry {
+        uint64_t id;
+        uint64_t checkpoint;
+        uint64_t timestamp;
+    };
+
+    struct CheckpointTrace : public intrusive_list_node<CheckpointTrace> {
+        uint64_t capacity;
+        uint64_t len;
+        struct CheckpointTraceEntry *buffer;
+    };
+
+    static constexpr uint64_t checkpoint_trace_capacity = 128 * 1024;
+    static std::mutex checkpoint_trace_list_lock;
+    static intrusive_list<CheckpointTrace> checkpoint_trace_list;
+
+    __thread struct CheckpointTrace *trace;
+
+    struct dump_data {
+        bool empty;
+        FILE *stream;
+    };
+
+    static void dump(struct CheckpointTrace *trace, struct dump_data *data) {
+        uint64_t len = std::atomic_load_explicit(reinterpret_cast<const std::atomic<uint64_t> *>(&trace->len),
+                                                 std::memory_order_acquire);
+
+        for (uint64_t i = 0; i < len; i++) {
+            uint64_t checkpoint = trace->buffer[i].checkpoint;
+
+            assert(checkpoint <= NUM_CHECKPOINTS);
+
+            if (i == 0 && !data->empty) {
+                fprintf(data->stream, ",\n");
+            }
+            data->empty = false;
+
+            fprintf(data->stream, "  {\n");
+            fprintf(data->stream, "    \"name\" : \"%s\",\n", checkpoint_name[checkpoint]);
+            fprintf(data->stream, "    \"ph\" : \"%s\",\n", (checkpoint % 2) == 0 ? "B" : "E");
+            fprintf(data->stream, "    \"pid\" : %lld,\n", (unsigned long long)trace);
+            fprintf(data->stream, "    \"tid\" : %ld,\n", trace->buffer[i].id);
+            fprintf(data->stream, "    \"ts\" : %ld\n", trace->buffer[i].timestamp);
+            fprintf(data->stream, "  }");
+
+            if (i < len - 1) {
+                fprintf(data->stream, ",\n");
+            }
+        }
+    }
+
+    void checkpoint_trace_dump(FILE *stream) {
+        struct dump_data dump_data = {
+            .empty = true,
+            .stream = stream,
+        };
+
+        fprintf(stream, "[\n");
+        checkpoint_trace_list_lock.lock();
+        for (auto trace : checkpoint_trace_list) {
+            dump(trace, &dump_data);
+        }
+        checkpoint_trace_list_lock.unlock();
+        fprintf(stream, "\n]\n");
+    }
+
+    static void reset(struct CheckpointTrace *trace) {
+        const uint64_t zero = 0;
+
+        std::atomic_store_explicit(reinterpret_cast<std::atomic<uint64_t> *>(&trace->len),
+                                   zero, std::memory_order_relaxed);
+    }
+
+    void checkpoint_trace_reset(void) {
+        checkpoint_trace_list_lock.lock();
+        for (auto trace : checkpoint_trace_list) {
+            reset(trace);
+        }
+        checkpoint_trace_list_lock.unlock();
+    }
+
+#ifdef PHOTON_ENABLE_CHECKPOINT
+
+    void record_checkpoint(enum Checkpoint checkpoint) {
+        if (!trace) {
+            const uint64_t zero = 0;
+
+            trace = new CheckpointTrace;
+            trace->capacity = checkpoint_trace_capacity;
+            trace->buffer = new CheckpointTraceEntry[trace->capacity];
+            std::atomic_store_explicit(reinterpret_cast<std::atomic<uint64_t> *>(&trace->len),
+                                       zero, std::memory_order_relaxed);
+
+            checkpoint_trace_list_lock.lock();
+            checkpoint_trace_list.push_back(trace);
+            checkpoint_trace_list_lock.unlock();
+        }
+
+        uint64_t len = std::atomic_load_explicit(reinterpret_cast<const std::atomic<uint64_t> *>(&trace->len),
+                                                 std::memory_order_acquire);
+
+        if (len < trace->capacity) {
+            trace->buffer[len].id = uint64_t(CURRENT);
+            trace->buffer[len].checkpoint = checkpoint;
+            trace->buffer[len].timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            std::atomic_store_explicit(reinterpret_cast<std::atomic<uint64_t> *>(&trace->len),
+                                       len + 1, std::memory_order_release);
+        }
+    }
+#endif
 }
